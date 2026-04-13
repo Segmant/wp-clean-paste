@@ -3,7 +3,7 @@
  * Plugin Name:       WP Clean Paste
  * Plugin URI:        https://github.com/Segmant/wp-clean-paste
  * Description:       Intercepts paste events in the WordPress admin and strips HTML, Word, Google Docs, and JSON formatting — showing a confirmation modal before inserting clean plain text. Works in ACF fields, the Gutenberg block editor, and the classic TinyMCE editor.
- * Version:           1.2.0
+ * Version:           1.3.0
  * Requires at least: 5.0
  * Requires PHP:      7.4
  * Author:            Chris Mulholland
@@ -191,6 +191,41 @@ add_action( 'admin_footer', function () {
 				cp.buildModal(plain, html, function(text) { cp.insertPlain(e.target, text); });
 			}
 		}, true);
+
+		// ── ACF WYSIWYG fields ───────────────────────────────────────────────────
+		// acf.addAction('wysiwyg_tinymce_init') fires every time ACF initialises a
+		// TinyMCE editor — including ones inside repeaters and flexible content.
+		// This is more reliable than tinymce.on('AddEditor') or tiny_mce_before_init
+		// because ACF calls it after its own setup is complete.
+		function attachAcfWysiwyg(ed) {
+			ed.on('PastePreProcess', function (e) {
+				var cp   = window.wpCleanPaste;
+				var html = e.content;
+				if (!cp || !cp.hasRealHtml(html)) return;
+
+				var tmp = ed.getDoc().createElement('div');
+				tmp.innerHTML = html;
+				var plain = (tmp.textContent || tmp.innerText || '').trim();
+
+				e.content = ''; // cancel default paste
+
+				cp.buildModal(plain, html, function (text) {
+					var safe = ed.dom.encode(text).replace(/\r\n|\r|\n/g, '<br>');
+					ed.insertContent(safe);
+				});
+			});
+		}
+
+		if (typeof acf !== 'undefined') {
+			acf.addAction('wysiwyg_tinymce_init', attachAcfWysiwyg);
+		} else {
+			// acf object loads after this script — wait for it
+			document.addEventListener('acf-init', function () {
+				if (typeof acf !== 'undefined') {
+					acf.addAction('wysiwyg_tinymce_init', attachAcfWysiwyg);
+				}
+			});
+		}
 
 	})();
 	</script>
