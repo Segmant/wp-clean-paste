@@ -3,7 +3,7 @@
  * Plugin Name:       WP Clean Paste
  * Plugin URI:        https://github.com/Segmant/wp-clean-paste
  * Description:       Intercepts paste events in the WordPress admin and strips HTML, Word, Google Docs, and JSON formatting — showing a confirmation modal before inserting clean plain text. Works in ACF fields, the Gutenberg block editor, and the classic TinyMCE editor.
- * Version:           1.0.0
+ * Version:           1.1.0
  * Requires at least: 5.0
  * Requires PHP:      7.4
  * Author:            Chris Mulholland
@@ -136,21 +136,33 @@ add_action( 'admin_footer', function () {
 			}
 		}, true);
 
-		// ── TinyMCE visual editor (runs inside an iframe — needs its own hook) ──
+		// ── TinyMCE / ACF WYSIWYG (runs inside an iframe — needs its own hook) ──
+		//
+		// We use PastePreProcess rather than the raw 'paste' event because TinyMCE's
+		// own paste plugin consumes the clipboard before our handler would ever see
+		// clipboardData. PastePreProcess fires after TinyMCE has already read the
+		// clipboard and exposes the result as e.content (HTML string). Setting
+		// e.content = '' cancels the default insert so we can show the modal first.
 		if (typeof tinymce !== 'undefined') {
 			tinymce.on('AddEditor', function (ev) {
-				ev.editor.on('paste', function (e) {
-					const cd    = e.clipboardData || (e.originalEvent && e.originalEvent.clipboardData);
-					if (!cd) return;
-					const html  = cd.getData('text/html');
-					const plain = cd.getData('text/plain');
+				ev.editor.on('PastePreProcess', function (e) {
+					const html = e.content;
+					if (!hasRealHtml(html)) return;
 
-					if (hasRealHtml(html) || looksLikeJson(plain)) {
-						e.preventDefault();
-						e.stopImmediatePropagation();
-						const editor = ev.editor;
-						buildModal(plain, html, (text) => editor.insertContent(text));
-					}
+					// Extract plain text from the HTML TinyMCE already parsed
+					const tmp = ev.editor.getDoc().createElement('div');
+					tmp.innerHTML = html;
+					const plain = (tmp.textContent || tmp.innerText || '').trim();
+
+					// Blank the paste so nothing is inserted before the modal resolves
+					e.content = '';
+
+					const editor = ev.editor;
+					buildModal(plain, html, function (text) {
+						// Encode HTML entities and preserve line breaks
+						const safe = editor.dom.encode(text).replace(/\n/g, '<br>');
+						editor.insertContent(safe);
+					});
 				});
 			});
 		}
