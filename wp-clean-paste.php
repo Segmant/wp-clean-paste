@@ -3,7 +3,7 @@
  * Plugin Name:       WP Clean Paste
  * Plugin URI:        https://github.com/Segmant/wp-clean-paste
  * Description:       Intercepts paste events in the WordPress admin and strips HTML, Word, Google Docs, and JSON formatting — showing a confirmation modal before inserting clean plain text. Works in ACF fields, the Gutenberg block editor, and the classic TinyMCE editor.
- * Version:           1.3.0
+ * Version:           1.4.0
  * Requires at least: 5.0
  * Requires PHP:      7.4
  * Author:            Chris Mulholland
@@ -18,54 +18,8 @@ if ( ! defined( 'ABSPATH' ) ) {
 }
 
 /**
- * Inject our PastePreProcess handler into every TinyMCE instance via the
- * tiny_mce_before_init PHP filter. This fires before any editor initialises,
- * so it catches ACF WYSIWYG fields that are set up before admin_footer runs.
- * Helper functions are defined on window.wpCleanPaste (see admin_footer below)
- * and will always exist by the time a user can physically paste anything.
- */
-add_filter( 'tiny_mce_before_init', function ( $settings ) {
-	$our_setup = <<<'JS'
-function(editor) {
-	editor.on('PastePreProcess', function(e) {
-		var cp = window.wpCleanPaste;
-		if (!cp) return;
-
-		var html = e.content;
-		if (!cp.hasRealHtml(html)) return;
-
-		// Strip HTML to get plain text using the editor's own document
-		var tmp = editor.getDoc().createElement('div');
-		tmp.innerHTML = html;
-		var plain = (tmp.textContent || tmp.innerText || '').trim();
-
-		// Cancel the default paste — modal will re-insert on confirm
-		e.content = '';
-
-		cp.buildModal(plain, html, function(text) {
-			// insertContent expects HTML; encode entities and convert newlines
-			var safe = editor.dom.encode(text).replace(/\r\n|\r|\n/g, '<br>');
-			editor.insertContent(safe);
-		});
-	});
-}
-JS;
-
-	if ( ! empty( $settings['setup'] ) ) {
-		// Merge with any existing setup callback
-		$settings['setup'] = 'function(editor){(' . $settings['setup'] . ')(editor);(' . $our_setup . ')(editor);}';
-	} else {
-		$settings['setup'] = $our_setup;
-	}
-
-	return $settings;
-} );
-
-/**
- * Define window.wpCleanPaste helpers and handle standard fields + Gutenberg.
- * TinyMCE WYSIWYG is handled via tiny_mce_before_init above; its paste handler
- * references window.wpCleanPaste which will be defined by the time any user
- * can paste (page is fully loaded long before a paste can occur).
+ * Define window.wpCleanPaste helpers, handle standard fields + Gutenberg,
+ * and attach native paste listeners to TinyMCE iframes (ACF WYSIWYG).
  */
 add_action( 'admin_footer', function () {
 	?>
@@ -192,40 +146,69 @@ add_action( 'admin_footer', function () {
 			}
 		}, true);
 
-		// ── ACF WYSIWYG fields ───────────────────────────────────────────────────
-		// acf.addAction('wysiwyg_tinymce_init') fires every time ACF initialises a
-		// TinyMCE editor — including ones inside repeaters and flexible content.
-		// This is more reliable than tinymce.on('AddEditor') or tiny_mce_before_init
-		// because ACF calls it after its own setup is complete.
-		function attachAcfWysiwyg(ed) {
-			ed.on('PastePreProcess', function (e) {
-				var cp   = window.wpCleanPaste;
-				var html = e.content;
-				if (!cp || !cp.hasRealHtml(html)) return;
+		// ── TinyMCE WYSIWYG (ACF + classic editor) ──────────────────────────────
+		// TinyMCE renders inside an <iframe id="EDITORID_ifr">.
+		// Rather than relying on TinyMCE or ACF JS APIs (which have timing and
+		// version issues), we attach a native paste listener directly to the iframe
+		// document in capture phase — which runs before TinyMCE's own paste plugin.
+		function attachToMceIframe(iframe) {
+			function wire() {
+				var doc = iframe.contentDocument;
+				if (!doc || doc.__wpcp) return; // already wired
+				doc.__wpcp = true;
 
-				var tmp = ed.getDoc().createElement('div');
-				tmp.innerHTML = html;
-				var plain = (tmp.textContent || tmp.innerText || '').trim();
+				doc.addEventListener('paste', function (e) {
+					var cp = window.wpCleanPaste;
+					if (!cp) return;
 
-				e.content = ''; // cancel default paste
+					var cd    = e.clipboardData;
+					if (!cd) return;
+					var html  = cd.getData('text/html');
+					var plain = cd.getData('text/plain');
 
-				cp.buildModal(plain, html, function (text) {
-					var safe = ed.dom.encode(text).replace(/\r\n|\r|\n/g, '<br>');
-					ed.insertContent(safe);
+					if (!cp.hasRealHtml(html) && !cp.looksLikeJson(plain)) return;
+
+					e.preventDefault();
+					e.stopImmediatePropagation();
+
+					// Get the TinyMCE instance so we can insertContent properly
+					var editorId = iframe.id.replace(/_ifr$/, '');
+					var ed = (typeof tinymce !== 'undefined') ? tinymce.get(editorId) : null;
+
+					cp.buildModal(plain, html, function (text) {
+						if (ed) {
+							var safe = ed.dom.encode(text).replace(/\r\n|\r|\n/g, '<br>');
+							ed.insertContent(safe);
+						} else {
+							doc.execCommand('insertText', false, text);
+						}
+					});
+				}, true); // capture phase — beats TinyMCE's own handlers
+			}
+
+			// iframe may already be loaded, or we need to wait
+			if (iframe.contentDocument && iframe.contentDocument.body) {
+				wire();
+			} else {
+				iframe.addEventListener('load', wire);
+			}
+		}
+
+		// Wire up any TinyMCE iframes already on the page
+		document.querySelectorAll('iframe[id$="_ifr"]').forEach(attachToMceIframe);
+
+		// Watch for iframes added dynamically (repeaters, flex content, tab switches)
+		new MutationObserver(function (mutations) {
+			mutations.forEach(function (m) {
+				m.addedNodes.forEach(function (node) {
+					if (node.nodeType !== 1) return;
+					if (node.matches('iframe[id$="_ifr"]')) {
+						attachToMceIframe(node);
+					}
+					node.querySelectorAll && node.querySelectorAll('iframe[id$="_ifr"]').forEach(attachToMceIframe);
 				});
 			});
-		}
-
-		if (typeof acf !== 'undefined') {
-			acf.addAction('wysiwyg_tinymce_init', attachAcfWysiwyg);
-		} else {
-			// acf object loads after this script — wait for it
-			document.addEventListener('acf-init', function () {
-				if (typeof acf !== 'undefined') {
-					acf.addAction('wysiwyg_tinymce_init', attachAcfWysiwyg);
-				}
-			});
-		}
+		}).observe(document.body, { childList: true, subtree: true });
 
 	})();
 	</script>
